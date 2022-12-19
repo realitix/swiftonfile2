@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+
+import asyncio
+import importlib
+import sys
+
+from oslo_config import cfg
+from oslo_log import log as logging
+from swift.common.utils import parse_options
+from swift.common.wsgi import appconfig, ConfigFileError
+
+
+LOG = logging.getLogger(__name__)
+CONF = cfg.CONF
+DOMAIN = "swiftonfile-watcher"
+DEFAULT_WATCHER = "swiftonfile.watcher.generic.GenericWatcher"
+
+logging.register_options(CONF)
+logging.setup(CONF, DOMAIN)
+
+
+if __name__ == "__main__":
+    conf_file, options = parse_options()
+    try:
+        conf = appconfig(conf_file, name="object-server")
+    except Exception as e:
+        raise ConfigFileError(
+            "Error trying to load config from %s: %s" % (conf_file, e)
+        )
+
+    watcher_driver_name = conf.get("watch_driver", DEFAULT_WATCHER)
+
+    LOG.info(f"Watcher selected: {watcher_driver_name}")
+    module_name, class_name = watcher_driver_name.rsplit(".", 1)
+    module = importlib.import_module(module_name)
+    watcher_driver_cls = getattr(module, class_name)
+
+    watcher = watcher_driver_cls(conf)
+    LOG.info("Starting SwiftOnFile Watcher service")
+    asyncio.get_event_loop().run_until_complete(watcher.watch())
