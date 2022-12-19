@@ -1,0 +1,11 @@
+[Unit]
+Description=OpenStack SwiftOnFile - Lustre Watcher
+After=syslog.target network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/swiftonfile-watcher /etc/swift/object-server.conf
+
+[Install]
+WantedBy=multi-user.target
