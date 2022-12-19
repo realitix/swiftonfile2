@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # Copyright (c) 2013 Red Hat, Inc.
 #
@@ -37,6 +37,6 @@ if len(args) < 1 or not os.path.exists(args[0]):
     parser.error("Filename missing")
 
 if options.json_format:
-    print json.dumps(read_metadata(args[0]))
+    print(json.dumps(read_metadata(args[0])))
 else:
     pprint.pprint(read_metadata(args[0]))

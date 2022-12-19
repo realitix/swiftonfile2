@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # Copyright (c) 2015 Red Hat, Inc.
 #
@@ -21,7 +21,7 @@ import sys
 import stat
 import errno
 import xattr
-import cPickle as pickle
+import pickle
 import multiprocessing
 
 from optparse import OptionParser
@@ -44,7 +44,7 @@ def clean_metadata(path, key_count):
     Can only be used when you know the key_count. Saves one unnecessarry
     removexattr() call. Ignores error when file or metadata isn't found.
     """
-    for key in xrange(0, key_count):
+    for key in range(0, key_count):
         try:
             xattr.removexattr(path, '%s%s' % (METADATA_KEY, (key or '')))
         except IOError as err:
@@ -148,7 +148,7 @@ stored in pickled format to JSON format."""
     (options, mount_paths) = parser.parse_args()
 
     if len(mount_paths) < 1:
-        print "Mountpoint path(s) missing."
+        print("Mountpoint path(s) missing.")
         parser.print_usage()
         sys.exit(-1)
 
