@@ -13,45 +13,90 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 import os
 import stat
 import errno
+from abc import ABC, abstractmethod
+
 try:
     from random import SystemRandom
+
     random = SystemRandom()
-except ImportError:
+except ImportError:  # pragma: no cover
     import random
 import logging
 import time
 from uuid import uuid4
 from eventlet import sleep
 from contextlib import contextmanager
-from swiftonfile.swift.common.exceptions import AlreadyExistsAsFile, \
-    AlreadyExistsAsDir, DiskFileContainerDoesNotExist
-from swift.common.utils import ThreadPool, hash_path, \
-    normalize_timestamp, fallocate, Timestamp
-from swift.common.exceptions import DiskFileNotExist, DiskFileError, \
-    DiskFileNoSpace, DiskFileDeviceUnavailable, DiskFileNotOpen, \
-    DiskFileExpired
+from swiftonfile.swift.common.exceptions import (
+    AlreadyExistsAsFile,
+    AlreadyExistsAsDir,
+    DiskFileContainerDoesNotExist,
+)
+from swift.common.utils import hash_path, normalize_timestamp, fallocate, Timestamp
+from swift.common.exceptions import (
+    DiskFileNotExist,
+    DiskFileError,
+    DiskFileNoSpace,
+    DiskFileDeviceUnavailable,
+    DiskFileNotOpen,
+    DiskFileExpired,
+    InvalidAccountInfo,
+)
 from swift.common.swob import multi_range_iterator
+from swift.common.utils import md5
 
 from swiftonfile.swift.common.exceptions import SwiftOnFileSystemOSError
-from swiftonfile.swift.common.fs_utils import do_fstat, do_open, do_close, \
-    do_unlink, do_chown, do_fsync, do_fchown, do_stat, do_write, do_read, \
-    do_fadvise64, do_rename, do_fdatasync, do_lseek, do_mkdir
-from swiftonfile.swift.common.utils import read_metadata, write_metadata, \
-    validate_object, create_object_metadata, rmobjdir, dir_is_object, \
-    get_object_metadata, write_pickle
-from swiftonfile.swift.common.utils import X_CONTENT_TYPE, \
-    X_TIMESTAMP, X_TYPE, X_OBJECT_TYPE, FILE, OBJECT, DIR_TYPE, \
-    FILE_TYPE, DEFAULT_UID, DEFAULT_GID, DIR_NON_OBJECT, DIR_OBJECT, \
-    X_ETAG, X_CONTENT_LENGTH, X_MTIME
+from swiftonfile.swift.common.fs_utils import (
+    do_fstat,
+    do_open,
+    do_close,
+    do_unlink,
+    do_chown,
+    do_fsync,
+    do_fchown,
+    do_stat,
+    do_write,
+    do_read,
+    do_fadvise64,
+    do_rename,
+    do_fdatasync,
+    do_lseek,
+    do_mkdir,
+)
+from swiftonfile.swift.common.utils import (
+    read_metadata,
+    write_metadata,
+    validate_object,
+    create_object_metadata,
+    rmobjdir,
+    dir_is_object,
+    get_object_metadata,
+    write_pickle,
+    get_user_uid_gid,
+    get_group_gid,
+)
+from swiftonfile.swift.common.utils import (
+    X_CONTENT_TYPE,
+    X_TIMESTAMP,
+    X_TYPE,
+    X_OBJECT_TYPE,
+    FILE,
+    OBJECT,
+    DIR_TYPE,
+    FILE_TYPE,
+    DEFAULT_UID,
+    DEFAULT_GID,
+    DIR_NON_OBJECT,
+    DIR_OBJECT,
+    X_ETAG,
+    X_CONTENT_LENGTH,
+    X_MTIME,
+)
 from swift.obj.diskfile import DiskFileManager as SwiftDiskFileManager
 from swift.obj.diskfile import get_async_dir
-
-# FIXME: Hopefully we'll be able to move to Python 2.7+ where O_CLOEXEC will
-# be back ported. See http://www.python.org/dev/peps/pep-0433/
-O_CLOEXEC = 0o2000000
 
 MAX_RENAME_ATTEMPTS = 10
 MAX_OPEN_ATTEMPTS = 10
@@ -84,29 +129,33 @@ def make_directory(full_path, uid, gid, metadata=None):
             except SwiftOnFileSystemOSError as serr:
                 # FIXME: Ideally we'd want to return an appropriate error
                 # message and code in the PUT Object REST API response.
-                raise DiskFileError("make_directory: mkdir failed"
-                                    " because path %s already exists, and"
-                                    " a subsequent stat on that same"
-                                    " path failed (%s)" % (full_path,
-                                                           str(serr)))
+                raise DiskFileError(
+                    "make_directory: mkdir failed"
+                    " because path %s already exists, and"
+                    " a subsequent stat on that same"
+                    " path failed (%s)" % (full_path, str(serr))
+                )
             else:
                 is_dir = stat.S_ISDIR(stats.st_mode)
                 if not is_dir:
                     # FIXME: Ideally we'd want to return an appropriate error
                     # message and code in the PUT Object REST API response.
-                    raise AlreadyExistsAsFile("make_directory:"
-                                              " mkdir failed on path %s"
-                                              " because it already exists"
-                                              " but not as a directory"
-                                              % (full_path))
+                    raise AlreadyExistsAsFile(
+                        "make_directory:"
+                        " mkdir failed on path %s"
+                        " because it already exists"
+                        " but not as a directory" % (full_path)
+                    )
             return True, metadata
         elif err.errno == errno.ENOTDIR:
             # FIXME: Ideally we'd want to return an appropriate error
             # message and code in the PUT Object REST API response.
-            raise AlreadyExistsAsFile("make_directory:"
-                                      " mkdir failed because some "
-                                      "part of path %s is not in fact"
-                                      " a directory" % (full_path))
+            raise AlreadyExistsAsFile(
+                "make_directory:"
+                " mkdir failed because some "
+                "part of path %s is not in fact"
+                " a directory" % (full_path)
+            )
         elif err.errno == errno.EIO:
             # Sometimes Fuse will return an EIO error when it does not know
             # how to handle an unexpected, but transient situation. It is
@@ -117,45 +166,55 @@ def make_directory(full_path, uid, gid, metadata=None):
                 stats = do_stat(full_path)
             except SwiftOnFileSystemOSError as serr:
                 if serr.errno == errno.ENOENT:
-                    errmsg = "make_directory: mkdir failed on" \
-                             " path %s (EIO), and a subsequent stat on" \
-                             " that same path did not find the file." % (
-                                 full_path,)
+                    errmsg = (
+                        "make_directory: mkdir failed on"
+                        " path %s (EIO), and a subsequent stat on"
+                        " that same path did not find the file." % (full_path,)
+                    )
                 else:
-                    errmsg = "make_directory: mkdir failed on" \
-                             " path %s (%s), and a subsequent stat on" \
-                             " that same path failed as well (%s)" % (
-                                 full_path, str(err), str(serr))
+                    errmsg = (
+                        "make_directory: mkdir failed on"
+                        " path %s (%s), and a subsequent stat on"
+                        " that same path failed as well (%s)"
+                        % (full_path, str(err), str(serr))
+                    )
                 raise DiskFileError(errmsg)
             else:
                 if not stats:
-                    errmsg = "make_directory: mkdir failed on" \
-                             " path %s (EIO), and a subsequent stat on" \
-                             " that same path did not find the file." % (
-                                 full_path,)
+                    errmsg = (
+                        "make_directory: mkdir failed on"
+                        " path %s (EIO), and a subsequent stat on"
+                        " that same path did not find the file." % (full_path,)
+                    )
                     raise DiskFileError(errmsg)
                 else:
                     # The directory at least exists now
                     is_dir = stat.S_ISDIR(stats.st_mode)
                     if is_dir:
                         # Dump the stats to the log with the original exception
-                        logging.warn("make_directory: mkdir initially"
-                                     " failed on path %s (%s) but a stat()"
-                                     " following that succeeded: %r" %
-                                     (full_path, str(err), stats))
+                        logging.warn(
+                            "make_directory: mkdir initially"
+                            " failed on path %s (%s) but a stat()"
+                            " following that succeeded: %r"
+                            % (full_path, str(err), stats)
+                        )
                         # Assume another entity took care of the proper setup.
                         return True, metadata
                     else:
-                        raise DiskFileError("make_directory: mkdir"
-                                            " initially failed on path %s (%s)"
-                                            " but now we see that it exists"
-                                            " but is not a directory (%r)" %
-                                            (full_path, str(err), stats))
+                        raise DiskFileError(
+                            "make_directory: mkdir"
+                            " initially failed on path %s (%s)"
+                            " but now we see that it exists"
+                            " but is not a directory (%r)"
+                            % (full_path, str(err), stats)
+                        )
         else:
             # Some other potentially rare exception occurred that does not
             # currently warrant a special log entry to help diagnose.
-            raise DiskFileError("make_directory: mkdir failed on"
-                                " path %s (%s)" % (full_path, str(err)))
+            raise DiskFileError(
+                "make_directory: mkdir failed on"
+                " path %s (%s)" % (full_path, str(err))
+            )
     else:
         if metadata:
             # We were asked to set the initial metadata for this object.
@@ -179,7 +238,7 @@ def _adjust_metadata(fd, metadata):
     # Fix up the metadata to ensure it has a proper value for the
     # Content-Type metadata, as well as an X_TYPE and X_OBJECT_TYPE
     # metadata values.
-    content_type = metadata.get(X_CONTENT_TYPE, '')
+    content_type = metadata.get(X_CONTENT_TYPE, "")
 
     if not content_type:
         # FIXME: How can this be that our caller supplied us with metadata
@@ -205,6 +264,91 @@ def _adjust_metadata(fd, metadata):
     return metadata
 
 
+class BaseMappingDiskFileBehavior(ABC):
+    def __init__(self, conf):
+        self.reseller_prefix = [
+            x.strip() for x in conf.get("match_fs_reseller_prefix", "AUTH").split(",")
+        ]
+        self.ignore_accounts = [
+            x.strip() for x in conf.get("match_fs_ignore_accounts", "").split(",")
+        ]
+
+    def get_uid_gid(self, account):
+        # remove prefix
+        noprefix_account = account
+        for prefix in self.reseller_prefix:
+            noprefix_account = noprefix_account.replace(f"{prefix}_", "")
+
+        # check if account is ignored
+        if noprefix_account not in self.ignore_accounts:
+            return self.find_uid_gid(noprefix_account)
+
+        return DEFAULT_UID, DEFAULT_GID
+
+    @abstractmethod
+    def find_uid_gid(self, account):
+        pass
+
+
+class UserMappingDiskFileBehavior(BaseMappingDiskFileBehavior):
+    """
+    Behavior class for DiskFileManager.
+    This class create a mapping between account name and username.
+    The account name is the username in the underlying fs.
+    """
+
+    def find_uid_gid(self, account):
+        try:
+            return get_user_uid_gid(account)
+        except KeyError:
+            msg = (
+                f"Swift user {account} not existing on file system. "
+                "The user must exist on filesystem."
+            )
+            raise InvalidAccountInfo(msg)
+
+
+class GroupMappingDiskFileBehavior(BaseMappingDiskFileBehavior):
+    """
+    Behavior class for DiskFileManager.
+    This class create a mapping between account name and group name.
+    The account name is the group name in the underlying fs.
+    For the user id, we first try to find a user with the same name as the group,
+    else we take the group name in the configuration.
+    """
+
+    def __init__(self, conf):
+        super().__init__(conf)
+
+        # get uid of default user
+        default_username = conf.get("match_fs_default_user", "root")
+        try:
+            self.default_uid, _ = get_user_uid_gid(default_username)
+        except KeyError:
+            msg = (
+                f"Default user {default_username} not existing on file system. "
+                "Please check the value of match_fs_default_user."
+            )
+            raise InvalidAccountInfo(msg)
+
+    def find_uid_gid(self, account):
+        try:
+            gid = get_group_gid(account)
+        except KeyError:
+            msg = (
+                f"Swift group {account} not existing on file system. "
+                "The group must exist on filesystem."
+            )
+            raise InvalidAccountInfo(msg)
+
+        try:
+            uid, _ = get_user_uid_gid(account)
+        except KeyError:
+            uid = self.default_uid
+
+        return uid, gid
+
+
 class DiskFileManager(SwiftDiskFileManager):
     """
     Management class for devices, providing common place for shared parameters
@@ -222,32 +366,64 @@ class DiskFileManager(SwiftDiskFileManager):
     :param conf: caller provided configuration object
     :param logger: caller provided logger
     """
-    def get_diskfile(self, device, partition, account, container, obj,
-                     policy=None, **kwargs):
+
+    def __init__(self, conf, logger):
+        super().__init__(conf, logger)
+
+        # load match fs user behavior
+        match_fs_user_classname = conf.get("match_fs_user")
+        self.match_fs_user = None
+        if match_fs_user_classname:
+            module_name, class_name = match_fs_user_classname.rsplit(".", 1)
+            module = importlib.import_module(module_name)
+            match_fs_user_cls = getattr(module, class_name)
+            self.match_fs_user = match_fs_user_cls(conf)
+
+        swift_user = conf.get("user")
+        if self.match_fs_user and swift_user != "root":
+            raise InvalidAccountInfo(
+                "match_fs_user set but Swift Object Server "
+                f"started with user {swift_user}. You need to start "
+                "Swift Object Server with root if you want to enable match_fs_user."
+            )
+
+    def get_diskfile(
+        self, device, partition, account, container, obj, policy=None, **kwargs
+    ):
         dev_path = self.get_dev_path(device, self.mount_check)
         if not dev_path:
             raise DiskFileDeviceUnavailable()
-        return DiskFile(self, dev_path, self.threadpools[device],
-                        partition, account, container, obj,
-                        policy=policy, **kwargs)
 
-    def pickle_async_update(self, device, account, container, obj, data,
-                            timestamp, policy):
+        if self.match_fs_user:
+            try:
+                kwargs["uid"], kwargs["gid"] = self.match_fs_user.get_uid_gid(account)
+            except InvalidAccountInfo as e:
+                logging.error(str(e))
+                raise
+
+        return DiskFile(
+            self, dev_path, partition, account, container, obj, policy=policy, **kwargs
+        )
+
+    def pickle_async_update(
+        self, device, account, container, obj, data, timestamp, policy
+    ):
         # This method invokes swiftonfile's writepickle method.
         # Is patching just write_pickle and calling parent method better ?
         device_path = self.construct_dev_path(device)
         async_dir = os.path.join(device_path, get_async_dir(policy))
         ohash = hash_path(account, container, obj)
-        self.threadpools[device].run_in_thread(
-            write_pickle,
+        write_pickle(
             data,
-            os.path.join(async_dir, ohash[-3:], ohash + '-' +
-                         normalize_timestamp(timestamp)),
-            os.path.join(device_path, 'tmp'))
-        self.logger.increment('async_pendings')
+            os.path.join(
+                async_dir, ohash[-3:], ohash + "-" + normalize_timestamp(timestamp)
+            ),
+            os.path.join(device_path, "tmp"),
+        )
+        self.logger.increment("async_pendings")
 
 
-class DiskFileWriter(object):
+class DiskFileWriter:
     """
     Encapsulation of the write context for servicing PUT REST API
     requests. Serves as the context manager object for DiskFile's create()
@@ -255,11 +431,14 @@ class DiskFileWriter(object):
 
 
     """
-    def __init__(self, fd, tmppath, disk_file):
+
+    def __init__(self, size, disk_file):
         # Parameter tracking
-        self._fd = fd
-        self._tmppath = tmppath
         self._disk_file = disk_file
+        self._fd = None
+        self._tmppath = None
+        self._size = size
+        self._chunks_etag = md5(usedforsecurity=False)
 
         # Internal attributes
         self._upload_size = 0
@@ -278,6 +457,131 @@ class DiskFileWriter(object):
                 do_fadvise64(self._fd, self._last_sync, diff)
                 self._last_sync = self._upload_size
 
+    def open(self):
+        # Create /account/container directory structure on mount point root
+        try:
+            os.makedirs(self._disk_file._container_path)
+        except OSError as err:
+            if err.errno != errno.EEXIST:
+                raise
+
+        data_file = os.path.join(self._disk_file._put_datadir, self._disk_file._obj)
+
+        # Assume the full directory path exists to the file already, and
+        # construct the proper name for the temporary file.
+        attempts = 1
+        while True:
+            # To know more about why following temp file naming convention is
+            # used, please read this GlusterFS doc:
+            # https://github.com/gluster/glusterfs/blob/master/doc/features/dht.md#rename-optimizations  # noqa
+            tmpfile = "." + self._disk_file._obj + "." + uuid4().hex
+            self._tmppath = os.path.join(self._disk_file._put_datadir, tmpfile)
+            try:
+                self._fd = do_open(
+                    self._tmppath, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+                )
+            except SwiftOnFileSystemOSError as gerr:
+                if gerr.errno in (errno.ENOSPC, errno.EDQUOT):
+                    # Raise DiskFileNoSpace to be handled by upper layers when
+                    # there is no space on disk OR when quota is exceeded
+                    raise DiskFileNoSpace()
+                if gerr.errno == errno.ENOTDIR:
+                    raise AlreadyExistsAsFile(
+                        "do_open(): failed on %s,"
+                        "  path or part of a"
+                        " path is not a directory" % (self._tmppath)
+                    )
+
+                if gerr.errno not in (errno.ENOENT, errno.EEXIST, errno.EIO):
+                    # FIXME: Other cases we should handle?
+                    raise
+                if attempts >= MAX_OPEN_ATTEMPTS:
+                    # We failed after N attempts to create the temporary
+                    # file.
+                    raise DiskFileError(
+                        "DiskFile.create(): failed to"
+                        " successfully create a temporary file"
+                        " without running into a name conflict"
+                        " after %d of %d attempts for: %s"
+                        % (attempts, MAX_OPEN_ATTEMPTS, data_file)
+                    )
+                if gerr.errno == errno.EEXIST:
+                    # Retry with a different random number.
+                    attempts += 1
+                elif gerr.errno == errno.EIO:
+                    # FIXME: Possible FUSE issue or race condition, let's
+                    # sleep on it and retry the operation.
+                    _random_sleep()
+                    logging.warn(
+                        "DiskFile.create(): %s ... retrying in" " 0.1 secs", gerr
+                    )
+                    attempts += 1
+                elif not self._disk_file._obj_path:
+                    # ENOENT
+                    # No directory hierarchy and the create failed telling us
+                    # the container or volume directory does not exist. This
+                    # could be a FUSE issue or some race condition, so let's
+                    # sleep a bit and retry.
+                    # Handle race:
+                    # This can be the issue when memcache has cached that the
+                    # container exists. If someone removes the container dir
+                    # from filesystem, it's not reflected in memcache. So
+                    # swift reports that the container exists and this code
+                    # tries to create a file in a directory that does not
+                    # exist. However, it's wrong to create the container here.
+                    _random_sleep()
+                    logging.warn(
+                        "DiskFile.create(): %s ... retrying in" " 0.1 secs", gerr
+                    )
+                    attempts += 1
+                    if attempts > 2:
+                        # Ideally we would want to return 404 indicating that
+                        # the container itself does not exist. Can't be done
+                        # though as the caller won't catch DiskFileNotExist.
+                        # We raise an exception with a meaningful name for
+                        # correctness.
+                        logging.warn(
+                            "Container dir %s does not exist", self._container_path
+                        )
+                        raise DiskFileContainerDoesNotExist
+                elif attempts > 1:
+                    # Got ENOENT after previously making the path. This could
+                    # also be a FUSE issue or some race condition, nap and
+                    # retry.
+                    _random_sleep()
+                    logging.warn(
+                        "DiskFile.create(): %s ... retrying in" " 0.1 secs" % gerr
+                    )
+                    attempts += 1
+                else:
+                    # It looks like the path to the object does not already
+                    # exist; don't count this as an attempt, though, since
+                    # we perform the open() system call optimistically.
+                    self._disk_file._create_dir_object(self._disk_file._obj_path)
+            else:
+                # Disable coverage (bug in python coverage)
+                break  # pragma: no cover
+
+        if self._size is not None and self._size > 0:
+            try:
+                fallocate(self._fd, self._size)
+            except OSError as err:
+                if err.errno in (errno.ENOSPC, errno.EDQUOT):
+                    raise DiskFileNoSpace()
+                raise
+        # Ensure it is properly owned before we make it available.
+        if not (
+            (self._disk_file._uid == DEFAULT_UID)
+            and (self._disk_file._gid == DEFAULT_GID)
+        ):
+            # If both UID and GID is -1 (default values), it has no effect.
+            # So don't do a fchown.
+            # Further, at the time of this writing, UID and GID information
+            # is not passed to DiskFile.
+            do_fchown(self._fd, self._disk_file._uid, self._disk_file._gid)
+
+        return self
+
     def close(self):
         """
         Close the file descriptor
@@ -285,6 +589,8 @@ class DiskFileWriter(object):
         if self._fd:
             do_close(self._fd)
             self._fd = None
+        if self._tmppath:
+            do_unlink(self._tmppath)
 
     def write(self, chunk):
         """
@@ -296,9 +602,17 @@ class DiskFileWriter(object):
 
         :returns: the total number of bytes written to an object
         """
-        df = self._disk_file
-        df._threadpool.run_in_thread(self._write_entire_chunk, chunk)
+        self._chunks_etag.update(chunk)
+        self._write_entire_chunk(chunk)
         return self._upload_size
+
+    def chunks_finished(self):
+        """
+        Expose internal stats about written chunks.
+
+        :returns: a tuple, (upload_size, etag)
+        """
+        return self._upload_size, self._chunks_etag.hexdigest()
 
     def _finalize_put(self, metadata):
         # Write out metadata before fsync() to ensure it is also forced to
@@ -325,9 +639,10 @@ class DiskFileWriter(object):
             try:
                 do_rename(self._tmppath, df._data_file)
             except OSError as err:
-                if err.errno in (errno.ENOENT, errno.EIO,
-                                 errno.EBUSY, errno.ESTALE) \
-                        and attempts < MAX_RENAME_ATTEMPTS:
+                if (
+                    err.errno in (errno.ENOENT, errno.EIO, errno.EBUSY, errno.ESTALE)
+                    and attempts < MAX_RENAME_ATTEMPTS
+                ):
                     # Some versions of GlusterFS had rename() as non-blocking
                     # operation. So we check for STALE and EBUSY. This was
                     # fixed recently: http://review.gluster.org/#/c/13366/
@@ -350,46 +665,53 @@ class DiskFileWriter(object):
                     if not tpstats or tfstats.st_ino != tpstats.st_ino:
                         # Temporary file name conflict
                         raise DiskFileError(
-                            'DiskFile.put(): temporary file, %s, was'
-                            ' already renamed (targeted for %s)' % (
-                                self._tmppath, df._data_file))
+                            "DiskFile.put(): temporary file, %s, was"
+                            " already renamed (targeted for %s)"
+                            % (self._tmppath, df._data_file)
+                        )
                     else:
                         # Data file target name now has a bad path!
                         dfstats = do_stat(df._put_datadir)
                         if not dfstats:
                             raise DiskFileError(
-                                'DiskFile.put(): path to object, %s, no'
-                                ' longer exists (targeted for %s)' % (
-                                    df._put_datadir, df._data_file))
+                                "DiskFile.put(): path to object, %s, no"
+                                " longer exists (targeted for %s)"
+                                % (df._put_datadir, df._data_file)
+                            )
                         else:
                             is_dir = stat.S_ISDIR(dfstats.st_mode)
                             if not is_dir:
                                 raise DiskFileError(
-                                    'DiskFile.put(): path to object, %s,'
-                                    ' no longer a directory (targeted for'
-                                    ' %s)' % (self._put_datadir,
-                                              df._data_file))
+                                    "DiskFile.put(): path to object, %s,"
+                                    " no longer a directory (targeted for"
+                                    " %s)" % (df._put_datadir, df._data_file)
+                                )
                             else:
                                 # Let's retry since everything looks okay
                                 logging.warn(
                                     "DiskFile.put(): rename('%s','%s')"
                                     " initially failed (%s) but a"
                                     " stat('%s') following that succeeded:"
-                                    " %r" % (
-                                        self._tmppath, df._data_file, str(err),
-                                        df._put_datadir, dfstats))
+                                    " %r"
+                                    % (
+                                        self._tmppath,
+                                        df._data_file,
+                                        str(err),
+                                        df._put_datadir,
+                                        dfstats,
+                                    )
+                                )
                                 attempts += 1
                                 continue
                 else:
                     raise SwiftOnFileSystemOSError(
-                        err.errno, "%s, rename('%s', '%s')" % (
-                            err.strerror, self._tmppath, df._data_file))
+                        err.errno,
+                        "%s, rename('%s', '%s')"
+                        % (err.strerror, self._tmppath, df._data_file),
+                    )
             else:
-                # Success!
-                break
-        # Close here so the calling context does not have to perform this
-        # in a thread.
-        self.close()
+                # Disable coverage (bug in python coverage)
+                break  # pragma: no cover
 
     def put(self, metadata):
         """
@@ -406,8 +728,7 @@ class DiskFileWriter(object):
         df = self._disk_file
 
         if dir_is_object(metadata):
-            df._threadpool.force_run_in_thread(
-                df._create_dir_object, df._data_file, metadata)
+            df._create_dir_object(df._data_file, metadata)
             return
 
         if df._is_dir:
@@ -415,15 +736,18 @@ class DiskFileWriter(object):
             # system, perhaps gratuitously created when another
             # object was created, or created externally to Swift
             # REST API servicing (UFO use case).
-            raise AlreadyExistsAsDir('DiskFile.put(): file creation failed'
-                                     ' since the target, %s, already exists'
-                                     ' as a directory' % df._data_file)
+            raise AlreadyExistsAsDir(
+                "DiskFile.put(): file creation failed"
+                " since the target, %s, already exists"
+                " as a directory" % df._data_file
+            )
 
-        df._threadpool.force_run_in_thread(self._finalize_put, metadata)
+        self._finalize_put(metadata)
 
         # Avoid the unlink() system call as part of the create context
         # cleanup
         self._tmppath = None
+        self.close()
 
     def commit(self, timestamp):
         """
@@ -436,7 +760,7 @@ class DiskFileWriter(object):
         pass
 
 
-class DiskFileReader(object):
+class DiskFileReader:
     """
     Encapsulation of the WSGI read context for servicing GET REST API
     requests. Serves as the context manager object for the
@@ -454,20 +778,18 @@ class DiskFileReader(object):
         specific. The API does not define the constructor arguments.
 
     :param fp: open file descriptor, -1 for a directory object
-    :param threadpool: thread pool to use for read operations
     :param disk_chunk_size: size of reads from disk in bytes
     :param obj_size: size of object on disk
     :param keep_cache_size: maximum object size that will be kept in cache
-    :param iter_hook: called when __iter__ returns a chunk
     :param keep_cache: should resulting reads be kept in the buffer cache
     """
-    def __init__(self, fd, threadpool, disk_chunk_size, obj_size,
-                 keep_cache_size, iter_hook=None, keep_cache=False):
+
+    def __init__(
+        self, fd, disk_chunk_size, obj_size, keep_cache_size, keep_cache=False
+    ):
         # Parameter tracking
         self._fd = fd
-        self._threadpool = threadpool
         self._disk_chunk_size = disk_chunk_size
-        self._iter_hook = iter_hook
         if keep_cache:
             # Caller suggests we keep this in cache, only do it if the
             # object's size is less than the maximum.
@@ -485,8 +807,7 @@ class DiskFileReader(object):
             bytes_read = 0
             while True:
                 if self._fd != -1:
-                    chunk = self._threadpool.run_in_thread(
-                        do_read, self._fd, self._disk_chunk_size)
+                    chunk = do_read(self._fd, self._disk_chunk_size)
                 else:
                     chunk = None
                 if chunk:
@@ -496,14 +817,14 @@ class DiskFileReader(object):
                         self._drop_cache(dropped_cache, diff)
                         dropped_cache = bytes_read
                     yield chunk
-                    if self._iter_hook:
-                        self._iter_hook()
                 else:
                     diff = bytes_read - dropped_cache
+                    # Drop cache
                     if diff > 0:
                         self._drop_cache(dropped_cache, diff)
                     break
         finally:
+            # Close
             if not self._suppress_file_closing:
                 self.close()
 
@@ -516,7 +837,7 @@ class DiskFileReader(object):
         else:
             length = None
         try:
-            for chunk in self:
+            for chunk in self:  # pragma: no cover
                 if length is not None:
                     length -= len(chunk)
                     if length < 0:
@@ -525,19 +846,20 @@ class DiskFileReader(object):
                         break
                 yield chunk
         finally:
+            # Close
             if not self._suppress_file_closing:
                 self.close()
 
     def app_iter_ranges(self, ranges, content_type, boundary, size):
         """Returns an iterator over the data file for a set of ranges"""
         if not ranges:
-            yield ''
-        else:
+            yield ""
+        else:  # pragma: no cover
             try:
                 self._suppress_file_closing = True
                 for chunk in multi_range_iterator(
-                        ranges, content_type, boundary, size,
-                        self.app_iter_range):
+                    ranges, content_type, boundary, size, self.app_iter_range
+                ):
                     yield chunk
             finally:
                 self._suppress_file_closing = False
@@ -558,7 +880,7 @@ class DiskFileReader(object):
                 do_close(fd)
 
 
-class DiskFile(object):
+class DiskFile:
     """
     Manage object files on disk.
 
@@ -570,20 +892,29 @@ class DiskFile(object):
 
     :param mgr: associated on-disk manager instance
     :param dev_path: device name/account_name for UFO.
-    :param threadpool: thread pool in which to do blocking operations
     :param account: account name for the object
     :param container: container name for the object
     :param obj: object name for the object
     :param uid: user ID disk object should assume (file or directory)
     :param gid: group ID disk object should assume (file or directory)
     """
-    def __init__(self, mgr, dev_path, threadpool, partition,
-                 account=None, container=None, obj=None,
-                 policy=None, uid=DEFAULT_UID, gid=DEFAULT_GID, **kwargs):
+
+    def __init__(
+        self,
+        mgr,
+        dev_path,
+        partition,
+        account=None,
+        container=None,
+        obj=None,
+        policy=None,
+        uid=DEFAULT_UID,
+        gid=DEFAULT_GID,
+        **kwargs,
+    ):
         # Variables partition and policy is currently unused.
         self._mgr = mgr
         self._device_path = dev_path
-        self._threadpool = threadpool or ThreadPool(nthreads=0)
         self._uid = int(uid)
         self._gid = int(gid)
         self._is_dir = False
@@ -595,40 +926,69 @@ class DiskFile(object):
         # Don't store a value for data_file until we know it exists.
         self._data_file = None
 
-        # Account name contains resller_prefix which is retained and not
+        # Account name contains reseller_prefix which is retained and not
         # stripped. This to conform to Swift's behavior where account name
         # entry in Account DBs contain resller_prefix.
         self._account = account
         self._container = container
 
-        self._container_path = \
-            os.path.join(self._device_path, self._account, self._container)
+        self._account_path = os.path.join(self._device_path, self._account)
+        self._container_path = os.path.join(self._account_path, self._container)
         obj = obj.strip(os.path.sep)
+        # obj_path contains folder of object
+        # self._obj containes file name
+        # /dir1/dir2/file.txt obj_path=dir1/dir2 obj=file.txt
         obj_path, self._obj = os.path.split(obj)
         if obj_path:
             self._obj_path = obj_path.strip(os.path.sep)
-            self._put_datadir = os.path.join(self._container_path,
-                                             self._obj_path)
+            self._put_datadir = os.path.join(self._container_path, self._obj_path)
         else:
-            self._obj_path = ''
+            self._obj_path = ""
             self._put_datadir = self._container_path
 
         self._data_file = os.path.join(self._put_datadir, self._obj)
         self._disk_file_open = False
 
+        # Init account and container path
+        # Useful to set UID and GID
+        make_directory(self._account_path, uid, gid)
+        make_directory(self._container_path, uid, gid)
+
     @property
     def timestamp(self):
         if self._metadata is None:
             raise DiskFileNotOpen()
-        return Timestamp(self._metadata.get('X-Timestamp'))
+        return Timestamp(self._metadata.get(X_TIMESTAMP))
 
     @property
     def data_timestamp(self):
         if self._metadata is None:
             raise DiskFileNotOpen()
-        return Timestamp(self._metadata.get('X-Timestamp'))
+        return Timestamp(self._metadata.get(X_TIMESTAMP))
 
-    def open(self):
+    @property
+    def durable_timestamp(self):
+        if self._metadata is None:
+            raise DiskFileNotOpen()
+        return Timestamp(self._metadata.get(X_TIMESTAMP))
+
+    @property
+    def fragments(self):
+        return None
+
+    @property
+    def content_type(self):
+        if self._metadata is None:
+            raise DiskFileNotOpen()
+        return self._metadata.get(X_CONTENT_TYPE)
+
+    @property
+    def content_type_timestamp(self):
+        if self._metadata is None:
+            raise DiskFileNotOpen()
+        return Timestamp(self._metadata.get(X_TIMESTAMP))
+
+    def open(self, modernize=False, current_time=None):
         """
         Open the object.
 
@@ -648,7 +1008,7 @@ class DiskFile(object):
         """
         # Writes are always performed to a temporary file
         try:
-            self._fd = do_open(self._data_file, os.O_RDONLY | O_CLOEXEC)
+            self._fd = do_open(self._data_file, os.O_RDONLY | os.O_CLOEXEC)
         except SwiftOnFileSystemOSError as err:
             if err.errno in (errno.ENOENT, errno.ENOTDIR):
                 # If the file does exist, or some part of the path does not
@@ -664,8 +1024,9 @@ class DiskFile(object):
             if not self._metadata:
                 self._metadata = read_metadata(self._fd)
             if not validate_object(self._metadata, self._stat):
-                self._metadata = create_object_metadata(self._fd, self._stat,
-                                                        self._metadata)
+                self._metadata = create_object_metadata(
+                    self._fd, self._stat, self._metadata
+                )
             assert self._metadata is not None
             self._filter_metadata()
 
@@ -674,20 +1035,22 @@ class DiskFile(object):
                 obj_size = 0
                 self._fd = -1
             else:
-                if self._is_object_expired(self._metadata):
+                if self._is_object_expired(self._metadata, current_time):
                     raise DiskFileExpired(metadata=self._metadata)
             self._obj_size = obj_size
         except (OSError, IOError, DiskFileExpired) as err:
             # Something went wrong. Context manager will not call
             # __exit__. So we close the fd manually here.
             self._close_fd()
-            if hasattr(err, 'errno') and err.errno == errno.ENOENT:
+            if hasattr(err, "errno") and err.errno == errno.ENOENT:
                 # Handle races: ENOENT can be raised by read_metadata()
                 # call in GlusterFS if file gets deleted by another
                 # client after do_open() succeeds
-                logging.warn("open(%s) succeeded but one of the subsequent "
-                             "syscalls failed with ENOENT. Raising "
-                             "DiskFileNotExist." % (self._data_file))
+                logging.warn(
+                    "open(%s) succeeded but one of the subsequent "
+                    "syscalls failed with ENOENT. Raising "
+                    "DiskFileNotExist." % (self._data_file)
+                )
                 raise DiskFileNotExist
             else:
                 # Re-raise the original exception after fd has been closed
@@ -696,9 +1059,9 @@ class DiskFile(object):
         self._disk_file_open = True
         return self
 
-    def _is_object_expired(self, metadata):
+    def _is_object_expired(self, metadata, current_time=None):
         try:
-            x_delete_at = int(metadata['X-Delete-At'])
+            x_delete_at = int(metadata["X-Delete-At"])
         except KeyError:
             pass
         except ValueError:
@@ -707,7 +1070,9 @@ class DiskFile(object):
             # We just let it pass
             pass
         else:
-            if x_delete_at <= time.time():
+            if current_time is None:
+                current_time = time.time()
+            if x_delete_at <= current_time:
                 return True
         return False
 
@@ -767,7 +1132,34 @@ class DiskFile(object):
             raise DiskFileNotOpen()
         return self._metadata
 
-    def read_metadata(self):
+    def get_metafile_metadata(self):
+        """No metafile metadata with SwiftOnFile"""
+        if self._metadata is None:
+            raise DiskFileNotOpen()
+        return self._metadata
+
+    def get_datafile_metadata(self):
+        """No Datafile metadata with SwiftOnFile"""
+        if self._metadata is None:
+            raise DiskFileNotOpen()
+        return self._metadata
+
+    def has_metadata(self):
+        """
+        Return True if the file has metadata, False otherwise
+        """
+        try:
+            metadata = read_metadata(self._data_file)
+        except (OSError, IOError) as err:
+            if err.errno in (errno.ENOENT, errno.ESTALE):
+                raise DiskFileNotExist
+            raise err
+
+        if not metadata:
+            return False
+        return True
+
+    def read_metadata(self, current_time=None):
         """
         Return the metadata for an object without requiring the caller to open
         the object first.
@@ -792,7 +1184,7 @@ class DiskFile(object):
                 raise DiskFileNotExist
             raise err
 
-        if self._metadata and self._is_object_expired(self._metadata):
+        if self._metadata and self._is_object_expired(self._metadata, current_time):
             raise DiskFileExpired(metadata=self._metadata)
 
         try:
@@ -813,7 +1205,7 @@ class DiskFile(object):
             self._filter_metadata()
             return self._metadata
 
-    def reader(self, iter_hook=None, keep_cache=False):
+    def reader(self, keep_cache=False):
         """
         Return a :class:`swift.common.swob.Response` class compatible
         "`app_iter`" object as defined by
@@ -822,7 +1214,6 @@ class DiskFile(object):
         For this implementation, the responsibility of closing the open file
         is passed to the :class:`swift.obj.diskfile.DiskFileReader` object.
 
-        :param iter_hook: called when __iter__ returns a chunk
         :param keep_cache: caller's preference for keeping data read in the
                            OS buffer cache
         :returns: a :class:`swift.obj.diskfile.DiskFileReader` object
@@ -830,13 +1221,19 @@ class DiskFile(object):
         if not self._disk_file_open:
             raise DiskFileNotOpen()
         dr = DiskFileReader(
-            self._fd, self._threadpool, self._mgr.disk_chunk_size,
-            self._obj_size, self._mgr.keep_cache_size,
-            iter_hook=iter_hook, keep_cache=keep_cache)
+            self._fd,
+            self._mgr.disk_chunk_size,
+            self._obj_size,
+            self._mgr.keep_cache_size,
+            keep_cache=keep_cache,
+        )
         # At this point the reader object is now responsible for closing
         # the file pointer.
         self._fd = None
         return dr
+
+    def writer(self, size=None):
+        return DiskFileWriter(size, self)
 
     def _create_dir_object(self, dir_path, metadata=None):
         """
@@ -875,9 +1272,11 @@ class DiskFile(object):
             # Some path of the parent did not exist, so loop around and
             # create that, pushing this parent on the stack.
             if os.path.sep not in cur_path:
-                raise DiskFileError("DiskFile._create_dir_object(): failed to"
-                                    " create directory path while exhausting"
-                                    " path elements to create: %s" % full_path)
+                raise DiskFileError(
+                    "DiskFile._create_dir_object(): failed to"
+                    " create directory path while exhausting"
+                    " path elements to create: %s" % full_path
+                )
             cur_path, child = cur_path.rsplit(os.path.sep, 1)
             assert child
             stack.append(child)
@@ -888,157 +1287,21 @@ class DiskFile(object):
             md = None if cur_path != full_path else metadata
             ret, newmd = make_directory(cur_path, self._uid, self._gid, md)
             if not ret:
-                raise DiskFileError("DiskFile._create_dir_object(): failed to"
-                                    " create directory path to target, %s,"
-                                    " on subpath: %s" % (full_path, cur_path))
+                raise DiskFileError(
+                    "DiskFile._create_dir_object(): failed to"
+                    " create directory path to target, %s,"
+                    " on subpath: %s" % (full_path, cur_path)
+                )
             child = stack.pop() if stack else None
         return True, newmd
 
     @contextmanager
     def create(self, size=None):
-        """
-        Context manager to create a file. We create a temporary file first, and
-        then return a DiskFileWriter object to encapsulate the state.
-
-        For Gluster, we first optimistically create the temporary file using
-        the "rsync-friendly" .NAME.random naming. If we find that some path to
-        the file does not exist, we then create that path and then create the
-        temporary file again. If we get file name conflict, we'll retry using
-        different random suffixes 1,000 times before giving up.
-
-        .. note::
-
-            An implementation is not required to perform on-disk
-            preallocations even if the parameter is specified. But if it does
-            and it fails, it must raise a `DiskFileNoSpace` exception.
-
-        :param size: optional initial size of file to explicitly allocate on
-                     disk
-        :raises DiskFileNoSpace: if a size is specified and allocation fails
-        :raises AlreadyExistsAsFile: if path or part of a path is not a \
-                                     directory
-        """
-        # Create /account/container directory structure on mount point root
+        dfw = self.writer(size)
         try:
-            os.makedirs(self._container_path)
-        except OSError as err:
-            if err.errno != errno.EEXIST:
-                raise
-
-        data_file = os.path.join(self._put_datadir, self._obj)
-
-        # Assume the full directory path exists to the file already, and
-        # construct the proper name for the temporary file.
-        fd = None
-        attempts = 1
-        while True:
-            # To know more about why following temp file naming convention is
-            # used, please read this GlusterFS doc:
-            # https://github.com/gluster/glusterfs/blob/master/doc/features/dht.md#rename-optimizations  # noqa
-            tmpfile = '.' + self._obj + '.' + uuid4().hex
-            tmppath = os.path.join(self._put_datadir, tmpfile)
-            try:
-                fd = do_open(tmppath,
-                             os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_CLOEXEC)
-            except SwiftOnFileSystemOSError as gerr:
-                if gerr.errno in (errno.ENOSPC, errno.EDQUOT):
-                    # Raise DiskFileNoSpace to be handled by upper layers when
-                    # there is no space on disk OR when quota is exceeded
-                    raise DiskFileNoSpace()
-                if gerr.errno == errno.ENOTDIR:
-                    raise AlreadyExistsAsFile('do_open(): failed on %s,'
-                                              '  path or part of a'
-                                              ' path is not a directory'
-                                              % (tmppath))
-
-                if gerr.errno not in (errno.ENOENT, errno.EEXIST, errno.EIO):
-                    # FIXME: Other cases we should handle?
-                    raise
-                if attempts >= MAX_OPEN_ATTEMPTS:
-                    # We failed after N attempts to create the temporary
-                    # file.
-                    raise DiskFileError('DiskFile.create(): failed to'
-                                        ' successfully create a temporary file'
-                                        ' without running into a name conflict'
-                                        ' after %d of %d attempts for: %s' % (
-                                            attempts, MAX_OPEN_ATTEMPTS,
-                                            data_file))
-                if gerr.errno == errno.EEXIST:
-                    # Retry with a different random number.
-                    attempts += 1
-                elif gerr.errno == errno.EIO:
-                    # FIXME: Possible FUSE issue or race condition, let's
-                    # sleep on it and retry the operation.
-                    _random_sleep()
-                    logging.warn("DiskFile.create(): %s ... retrying in"
-                                 " 0.1 secs", gerr)
-                    attempts += 1
-                elif not self._obj_path:
-                    # ENOENT
-                    # No directory hierarchy and the create failed telling us
-                    # the container or volume directory does not exist. This
-                    # could be a FUSE issue or some race condition, so let's
-                    # sleep a bit and retry.
-                    # Handle race:
-                    # This can be the issue when memcache has cached that the
-                    # container exists. If someone removes the container dir
-                    # from filesystem, it's not reflected in memcache. So
-                    # swift reports that the container exists and this code
-                    # tries to create a file in a directory that does not
-                    # exist. However, it's wrong to create the container here.
-                    _random_sleep()
-                    logging.warn("DiskFile.create(): %s ... retrying in"
-                                 " 0.1 secs", gerr)
-                    attempts += 1
-                    if attempts > 2:
-                        # Ideally we would want to return 404 indicating that
-                        # the container itself does not exist. Can't be done
-                        # though as the caller won't catch DiskFileNotExist.
-                        # We raise an exception with a meaningful name for
-                        # correctness.
-                        logging.warn("Container dir %s does not exist",
-                                     self._container_path)
-                        raise DiskFileContainerDoesNotExist
-                elif attempts > 1:
-                    # Got ENOENT after previously making the path. This could
-                    # also be a FUSE issue or some race condition, nap and
-                    # retry.
-                    _random_sleep()
-                    logging.warn("DiskFile.create(): %s ... retrying in"
-                                 " 0.1 secs" % gerr)
-                    attempts += 1
-                else:
-                    # It looks like the path to the object does not already
-                    # exist; don't count this as an attempt, though, since
-                    # we perform the open() system call optimistically.
-                    self._create_dir_object(self._obj_path)
-            else:
-                break
-        dw = None
-        try:
-            if size is not None and size > 0:
-                try:
-                    fallocate(fd, size)
-                except OSError as err:
-                    if err.errno in (errno.ENOSPC, errno.EDQUOT):
-                        raise DiskFileNoSpace()
-                    raise
-            # Ensure it is properly owned before we make it available.
-            if not ((self._uid == DEFAULT_UID) and (self._gid == DEFAULT_GID)):
-                # If both UID and GID is -1 (default values), it has no effect.
-                # So don't do a fchown.
-                # Further, at the time of this writing, UID and GID information
-                # is not passed to DiskFile.
-                do_fchown(fd, self._uid, self._gid)
-            dw = DiskFileWriter(fd, tmppath, self)
-            # It's now the responsibility of DiskFileWriter to close this fd.
-            fd = None
-            yield dw
+            yield dfw.open()
         finally:
-            if dw:
-                dw.close()
-                if dw._tmppath:
-                    do_unlink(dw._tmppath)
+            dfw.close()
 
     def write_metadata(self, metadata):
         """
@@ -1054,8 +1317,7 @@ class DiskFile(object):
         """
         metadata = self._keep_sys_metadata(metadata)
         data_file = os.path.join(self._put_datadir, self._obj)
-        self._threadpool.run_in_thread(
-            write_metadata, data_file, metadata)
+        write_metadata(data_file, metadata)
 
     def _keep_sys_metadata(self, metadata):
         """
@@ -1070,8 +1332,14 @@ class DiskFile(object):
         # metadata is fetched for the first time.
         orig_metadata = self._metadata or read_metadata(self._data_file)
 
-        sys_keys = [X_CONTENT_TYPE, X_ETAG, 'name', X_CONTENT_LENGTH,
-                    X_OBJECT_TYPE, X_TYPE]
+        sys_keys = [
+            X_CONTENT_TYPE,
+            X_ETAG,
+            "name",
+            X_CONTENT_LENGTH,
+            X_OBJECT_TYPE,
+            X_TYPE,
+        ]
 
         for key in sys_keys:
             if key in orig_metadata:
@@ -1112,7 +1380,7 @@ class DiskFile(object):
         # deleted the file, determine if the current directory and any
         # parent directory may be deleted.
         dirname = os.path.dirname(self._data_file)
-        while dirname and dirname != self._container_path:
+        while dirname and dirname != "/" and dirname != self._container_path:
             # Try to remove any directories that are not objects.
             if not rmobjdir(dirname):
                 # If a directory with objects has been found, we can stop
@@ -1147,7 +1415,7 @@ class DiskFile(object):
             if metadata and metadata[X_TIMESTAMP] >= timestamp:
                 return
 
-        self._threadpool.run_in_thread(self._unlinkold)
+        self._unlinkold()
 
         self._metadata = None
         self._data_file = None

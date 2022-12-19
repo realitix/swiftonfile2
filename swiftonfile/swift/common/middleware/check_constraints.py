@@ -32,57 +32,54 @@ For example::
     policies=swiftonfile,gold
 """
 
-from urllib import unquote
+from urllib.parse import unquote
 from swift.common.utils import get_logger
 from swift.common.swob import Request, HTTPBadRequest
 from swift.proxy.controllers.base import get_container_info
 from swift.common.storage_policy import POLICIES
 from swiftonfile.swift.common import constraints
-from swiftonfile.swift.common.constraints import check_object_creation \
-    as sof_check_object_creation
+from swiftonfile.swift.common.constraints import (
+    check_object_creation as sof_check_object_creation,
+)
 
 
-class CheckConstraintsMiddleware(object):
-
+class CheckConstraintsMiddleware:
     def __init__(self, app, conf):
         self.app = app
-        self.logger = get_logger(conf, log_route='constraints')
-        self.policies = conf.get('policies', '')
+        self.logger = get_logger(conf, log_route="constraints")
+        self.policies = conf.get("policies", "")
 
     def __call__(self, env, start_response):
         request = Request(env)
 
-        if request.method == 'PUT':
+        if request.method == "PUT":
             try:
-                version, account, container, obj = \
-                    request.split_path(1, 4, True)
+                version, account, container, obj = request.split_path(1, 4, True)
             except ValueError:
                 return self.app(env, start_response)
 
             # check container creation request
             if account and container and not obj:
-                policy_name = request.headers.get('X-Storage-Policy', '')
+                policy_name = request.headers.get("X-Storage-Policy", "")
                 default_policy = POLICIES.default.name
-                if (policy_name in self.policies) or \
-                   (policy_name == '' and default_policy in self.policies):
+                if (policy_name in self.policies) or (
+                    policy_name == "" and default_policy in self.policies
+                ):
 
                     container = unquote(container)
-                    if len(container) > constraints. \
-                            SOF_MAX_CONTAINER_NAME_LENGTH:
+                    if len(container) > constraints.SOF_MAX_CONTAINER_NAME_LENGTH:
                         resp = HTTPBadRequest(request=request)
-                        resp.body = \
-                            'Container name length of %d longer than %d' % \
-                            (len(container),
-                                constraints.SOF_MAX_CONTAINER_NAME_LENGTH)
+                        resp.body = b"Container name length of %d longer than %d" % (
+                            len(container),
+                            constraints.SOF_MAX_CONTAINER_NAME_LENGTH,
+                        )
                         return resp(env, start_response)
             elif account and container and obj:
                 # check object creation request
                 obj = unquote(obj)
 
-                container_info = get_container_info(
-                    env, self.app)
-                policy = POLICIES.get_by_index(
-                    container_info['storage_policy'])
+                container_info = get_container_info(env, self.app)
+                policy = POLICIES.get_by_index(container_info["storage_policy"])
 
                 if policy.name in self.policies:
                     error_response = sof_check_object_creation(request, obj)

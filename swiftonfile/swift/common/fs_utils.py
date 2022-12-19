@@ -27,10 +27,11 @@ from eventlet import sleep
 from swift.common.utils import load_libc_function
 from swiftonfile.swift.common.exceptions import SwiftOnFileSystemOSError
 from swift.common.exceptions import DiskFileNoSpace
+from functools import partial
 
 
 def do_getxattr(path, key):
-    return xattr.getxattr(path, key)
+    return xattr.getxattr(path, key).decode()
 
 
 def do_setxattr(path, key, value):
@@ -51,12 +52,14 @@ def do_write(fd, buf):
     except OSError as err:
         filename = get_filename_from_fd(fd)
         if err.errno in (errno.ENOSPC, errno.EDQUOT):
-            do_log_rl("do_write(%d, msg[%d]) failed: %s : %s",
-                      fd, len(buf), err, filename)
+            do_log_rl(
+                "do_write(%d, msg[%d]) failed: %s : %s", fd, len(buf), err, filename
+            )
             raise DiskFileNoSpace()
         else:
             raise SwiftOnFileSystemOSError(
-                err.errno, '%s, os.write("%s", ...)' % (err.strerror, fd))
+                err.errno, '%s, os.write("%s", ...)' % (err.strerror, fd)
+            )
     return cnt
 
 
@@ -65,7 +68,8 @@ def do_read(fd, n):
         buf = os.read(fd, n)
     except OSError as err:
         raise SwiftOnFileSystemOSError(
-            err.errno, '%s, os.read("%s", ...)' % (err.strerror, fd))
+            err.errno, '%s, os.read("%s", ...)' % (err.strerror, fd)
+        )
     return buf
 
 
@@ -84,18 +88,19 @@ def do_ismount(path):
             return False
         else:
             raise SwiftOnFileSystemOSError(
-                err.errno, '%s, os.lstat("%s")' % (err.strerror, path))
+                err.errno, '%s, os.lstat("%s")' % (err.strerror, path)
+            )
 
     if stat.S_ISLNK(s1.st_mode):
         # A symlink can never be a mount point
         return False
 
     try:
-        s2 = os.lstat(os.path.join(path, '..'))
+        s2 = os.lstat(os.path.join(path, ".."))
     except os.error as err:
         raise SwiftOnFileSystemOSError(
-            err.errno, '%s, os.lstat("%s")' % (err.strerror,
-                                               os.path.join(path, '..')))
+            err.errno, '%s, os.lstat("%s")' % (err.strerror, os.path.join(path, ".."))
+        )
 
     dev1 = s1.st_dev
     dev2 = s2.st_dev
@@ -121,7 +126,8 @@ def do_rmdir(path):
         os.rmdir(path)
     except OSError as err:
         raise SwiftOnFileSystemOSError(
-            err.errno, '%s, os.rmdir("%s")' % (err.strerror, path))
+            err.errno, '%s, os.rmdir("%s")' % (err.strerror, path)
+        )
 
 
 def do_chown(path, uid, gid):
@@ -129,8 +135,8 @@ def do_chown(path, uid, gid):
         os.chown(path, uid, gid)
     except OSError as err:
         raise SwiftOnFileSystemOSError(
-            err.errno, '%s, os.chown("%s", %s, %s)' % (
-                err.strerror, path, uid, gid))
+            err.errno, '%s, os.chown("%s", %s, %s)' % (err.strerror, path, uid, gid)
+        )
 
 
 def do_fchown(fd, uid, gid):
@@ -138,8 +144,8 @@ def do_fchown(fd, uid, gid):
         os.fchown(fd, uid, gid)
     except OSError as err:
         raise SwiftOnFileSystemOSError(
-            err.errno, '%s, os.fchown(%s, %s, %s)' % (
-                err.strerror, fd, uid, gid))
+            err.errno, "%s, os.fchown(%s, %s, %s)" % (err.strerror, fd, uid, gid)
+        )
 
 
 _STAT_ATTEMPTS = 10
@@ -161,17 +167,22 @@ def do_stat(path):
                 stats = None
             else:
                 raise SwiftOnFileSystemOSError(
-                    err.errno, '%s, os.stat("%s")[%d attempts]' % (
-                        err.strerror, path, i))
+                    err.errno,
+                    '%s, os.stat("%s")[%d attempts]' % (err.strerror, path, i),
+                )
         if i > 0:
-            logging.warn("fs_utils.do_stat():"
-                         " os.stat('%s') retried %d times (%s)",
-                         path, i, 'success' if stats else 'failure')
+            logging.warn(
+                "fs_utils.do_stat():" " os.stat('%s') retried %d times (%s)",
+                path,
+                i,
+                "success" if stats else "failure",
+            )
         return stats
     else:
         raise SwiftOnFileSystemOSError(
-            serr.errno, '%s, os.stat("%s")[%d attempts]' % (
-                serr.strerror, path, _STAT_ATTEMPTS))
+            serr.errno,
+            '%s, os.stat("%s")[%d attempts]' % (serr.strerror, path, _STAT_ATTEMPTS),
+        )
 
 
 def do_fstat(fd):
@@ -179,7 +190,8 @@ def do_fstat(fd):
         stats = os.fstat(fd)
     except OSError as err:
         raise SwiftOnFileSystemOSError(
-            err.errno, '%s, os.fstat(%s)' % (err.strerror, fd))
+            err.errno, "%s, os.fstat(%s)" % (err.strerror, fd)
+        )
     return stats
 
 
@@ -188,8 +200,8 @@ def do_open(path, flags, mode=0o777):
         fd = os.open(path, flags, mode)
     except OSError as err:
         raise SwiftOnFileSystemOSError(
-            err.errno, '%s, os.open("%s", %x, %o)' % (
-                err.strerror, path, flags, mode))
+            err.errno, '%s, os.open("%s", %x, %o)' % (err.strerror, path, flags, mode)
+        )
     return fd
 
 
@@ -203,12 +215,12 @@ def do_close(fd):
     except OSError as err:
         if err.errno in (errno.ENOSPC, errno.EDQUOT):
             filename = get_filename_from_fd(fd)
-            do_log_rl("do_close(%d) failed: %s : %s",
-                      fd, err, filename)
+            do_log_rl("do_close(%d) failed: %s : %s", fd, err, filename)
             raise DiskFileNoSpace()
         else:
             raise SwiftOnFileSystemOSError(
-                err.errno, '%s, os.close(%s)' % (err.strerror, fd))
+                err.errno, "%s, os.close(%s)" % (err.strerror, fd)
+            )
 
 
 def do_unlink(path, log=True):
@@ -217,10 +229,10 @@ def do_unlink(path, log=True):
     except OSError as err:
         if err.errno != errno.ENOENT:
             raise SwiftOnFileSystemOSError(
-                err.errno, '%s, os.unlink("%s")' % (err.strerror, path))
+                err.errno, '%s, os.unlink("%s")' % (err.strerror, path)
+            )
         else:
-            logging.warn("fs_utils: os.unlink failed on non-existent path: %s",
-                         path)
+            logging.warn("fs_utils: os.unlink failed on non-existent path: %s", path)
 
 
 def do_rename(old_path, new_path):
@@ -228,8 +240,8 @@ def do_rename(old_path, new_path):
         os.rename(old_path, new_path)
     except OSError as err:
         raise SwiftOnFileSystemOSError(
-            err.errno, '%s, os.rename("%s", "%s")' % (
-                err.strerror, old_path, new_path))
+            err.errno, '%s, os.rename("%s", "%s")' % (err.strerror, old_path, new_path)
+        )
 
 
 def do_fsync(fd):
@@ -237,7 +249,8 @@ def do_fsync(fd):
         os.fsync(fd)
     except OSError as err:
         raise SwiftOnFileSystemOSError(
-            err.errno, '%s, os.fsync("%s")' % (err.strerror, fd))
+            err.errno, '%s, os.fsync("%s")' % (err.strerror, fd)
+        )
 
 
 def do_fdatasync(fd):
@@ -247,7 +260,8 @@ def do_fdatasync(fd):
         do_fsync(fd)
     except OSError as err:
         raise SwiftOnFileSystemOSError(
-            err.errno, '%s, os.fdatasync("%s")' % (err.strerror, fd))
+            err.errno, '%s, os.fdatasync("%s")' % (err.strerror, fd)
+        )
 
 
 _posix_fadvise = None
@@ -256,10 +270,9 @@ _posix_fadvise = None
 def do_fadvise64(fd, offset, length):
     global _posix_fadvise
     if _posix_fadvise is None:
-        _posix_fadvise = load_libc_function('posix_fadvise64')
+        _posix_fadvise = load_libc_function("posix_fadvise64")
     # 4 means "POSIX_FADV_DONTNEED"
-    _posix_fadvise(fd, ctypes.c_uint64(offset),
-                   ctypes.c_uint64(length), 4)
+    _posix_fadvise(fd, ctypes.c_uint64(offset), ctypes.c_uint64(length), 4)
 
 
 def do_lseek(fd, pos, how):
@@ -267,7 +280,8 @@ def do_lseek(fd, pos, how):
         os.lseek(fd, pos, how)
     except OSError as err:
         raise SwiftOnFileSystemOSError(
-            err.errno, '%s, os.lseek("%s")' % (err.strerror, fd))
+            err.errno, '%s, os.lseek("%s")' % (err.strerror, fd)
+        )
 
 
 def get_filename_from_fd(fd, verify=False):
@@ -306,17 +320,22 @@ def get_filename_from_fd(fd, verify=False):
 
 def static_var(varname, value):
     """Decorator function to create pseudo static variables."""
+
     def decorate(func):
         setattr(func, varname, value)
         return func
+
     return decorate
+
 
 # Rate limit to emit log message once a second
 _DO_LOG_RL_INTERVAL = 1.0
 
+next_last_called = partial(next, repeat(0.0))
+
 
 @static_var("counter", defaultdict(int))
-@static_var("last_called", defaultdict(repeat(0.0).next))
+@static_var("last_called", defaultdict(next_last_called))
 def do_log_rl(msg, *args, **kwargs):
     """
     Rate limited logger.
@@ -324,7 +343,7 @@ def do_log_rl(msg, *args, **kwargs):
     :param msg: String or message to be logged
     :param log_level: Possible values- error, warning, info, debug, critical
     """
-    log_level = kwargs.get('log_level', "error")
+    log_level = kwargs.get("log_level", "error")
     if log_level not in ("error", "warning", "info", "debug", "critical"):
         log_level = "error"
 
@@ -333,12 +352,18 @@ def do_log_rl(msg, *args, **kwargs):
 
     if interval >= _DO_LOG_RL_INTERVAL:
         # Prefix PID of process and message count to original log msg
-        emit_msg = "[PID:" + str(os.getpid()) + "]" \
-            + "[RateLimitedLog;Count:" + str(do_log_rl.counter[msg]) + "] " \
+        emit_msg = (
+            "[PID:"
+            + str(os.getpid())
+            + "]"
+            + "[RateLimitedLog;Count:"
+            + str(do_log_rl.counter[msg])
+            + "] "
             + msg
+        )
         # log_level is a param for do_log_rl and not for logging.* methods
         try:
-            del kwargs['log_level']
+            del kwargs["log_level"]
         except KeyError:
             pass
 

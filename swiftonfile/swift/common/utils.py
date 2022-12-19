@@ -16,43 +16,61 @@
 import os
 import stat
 import json
+import re
 import errno
 import random
 import logging
+import pwd
+import grp
 from hashlib import md5
 from eventlet import sleep
-import cPickle as pickle
-from cStringIO import StringIO
+import pickle
+from io import BytesIO
 import pickletools
 from swiftonfile.swift.common.exceptions import SwiftOnFileSystemIOError
 from swift.common.exceptions import DiskFileNoSpace
-from swift.common.db import utf8encodekeys
-from swiftonfile.swift.common.fs_utils import do_stat, \
-    do_walk, do_rmdir, do_log_rl, get_filename_from_fd, do_open, \
-    do_getxattr, do_setxattr, do_removexattr, do_read, \
-    do_close, do_dup, do_lseek, do_fstat, do_fsync, do_rename
+from swift.common.db import native_str_keys_and_values
+from swiftonfile.swift.common.fs_utils import (
+    do_stat,
+    do_walk,
+    do_rmdir,
+    do_log_rl,
+    get_filename_from_fd,
+    do_open,
+    do_getxattr,
+    do_setxattr,
+    do_removexattr,
+    do_read,
+    do_close,
+    do_dup,
+    do_lseek,
+    do_fstat,
+    do_fsync,
+    do_rename,
+)
 
-X_CONTENT_TYPE = 'Content-Type'
-X_CONTENT_LENGTH = 'Content-Length'
-X_TIMESTAMP = 'X-Timestamp'
-X_TYPE = 'X-Type'
-X_ETAG = 'ETag'
-X_OBJECT_TYPE = 'X-Object-Type'
-X_MTIME = 'X-Object-PUT-Mtime'
-DIR_TYPE = 'application/directory'
-METADATA_KEY = 'user.swift.metadata'
+X_CONTENT_TYPE = "Content-Type"
+X_CONTENT_LENGTH = "Content-Length"
+X_TIMESTAMP = "X-Timestamp"
+X_TYPE = "X-Type"
+X_ETAG = "ETag"
+X_OBJECT_TYPE = "X-Object-Type"
+X_MTIME = "X-Object-PUT-Mtime"
+DIR_TYPE = "application/directory"
+METADATA_KEY = "user.swift.metadata"
 MAX_XATTR_SIZE = 65536
-DIR_NON_OBJECT = 'dir'
-DIR_OBJECT = 'marker_dir'
-FILE = 'file'
-FILE_TYPE = 'application/octet-stream'
-OBJECT = 'Object'
+DIR_NON_OBJECT = "dir"
+DIR_OBJECT = "marker_dir"
+FILE = "file"
+FILE_TYPE = "application/octet-stream"
+OBJECT = "Object"
 DEFAULT_UID = -1
 DEFAULT_GID = -1
 PICKLE_PROTOCOL = 2
 CHUNK_SIZE = 65536
 
 read_pickled_metadata = False
+REGEX_TMP_FILE = re.compile(r".*\.[0-9a-f]{32}\Z", re.I)
 
 
 def normalize_timestamp(timestamp):
@@ -70,7 +88,7 @@ def normalize_timestamp(timestamp):
     return "%016.05f" % (float(timestamp))
 
 
-class SafeUnpickler(object):
+class SafeUnpickler:
     """
     Loading a pickled stream is potentially unsafe and exploitable because
     the loading process can import modules/classes (via GLOBAL opcode) and
@@ -80,23 +98,24 @@ class SafeUnpickler(object):
     and is not a general purpose safe unpickler.
     """
 
-    __slots__ = 'OPCODE_BLACKLIST'
-    OPCODE_BLACKLIST = ('GLOBAL', 'REDUCE', 'BUILD', 'OBJ', 'NEWOBJ', 'INST',
-                        'EXT1', 'EXT2', 'EXT4')
-
-    @classmethod
-    def find_class(self, module, name):
-        # Do not allow importing of ANY module. This is really redundant as
-        # we block those OPCODEs that results in invocation of this method.
-        raise pickle.UnpicklingError('Potentially unsafe pickle')
+    OPCODE_BLACKLIST = (
+        "GLOBAL",
+        "REDUCE",
+        "BUILD",
+        "OBJ",
+        "NEWOBJ",
+        "INST",
+        "EXT1",
+        "EXT2",
+        "EXT4",
+    )
 
     @classmethod
     def loads(self, string):
         for opcode in pickletools.genops(string):
             if opcode[0].name in self.OPCODE_BLACKLIST:
-                raise pickle.UnpicklingError('Potentially unsafe pickle')
-        orig_unpickler = pickle.Unpickler(StringIO(string))
-        orig_unpickler.find_global = self.find_class
+                raise pickle.UnpicklingError("Potentially unsafe pickle")
+        orig_unpickler = pickle.Unpickler(BytesIO(string))
         return orig_unpickler.load()
 
 
@@ -104,7 +123,7 @@ pickle.loads = SafeUnpickler.loads
 
 
 def serialize_metadata(metadata):
-    return json.dumps(metadata, separators=(',', ':'))
+    return os.fsencode(json.dumps(metadata, separators=(",", ":")))
 
 
 def deserialize_metadata(metastr):
@@ -114,8 +133,18 @@ def deserialize_metadata(metastr):
     """
     global read_pickled_metadata
 
-    if metastr.startswith('\x80\x02}') and metastr.endswith('.') and \
-            read_pickled_metadata:
+    if type(metastr) is bytes:
+        start1 = b"\x80\x02}"
+        end1 = b"."
+        start2 = b"{"
+        end2 = b"}"
+    else:
+        start1 = "\x80\x02}"
+        end1 = "."
+        start2 = "{"
+        end2 = "}"
+
+    if metastr.startswith(start1) and metastr.endswith(end1) and read_pickled_metadata:
         # Assert that the serialized metadata is pickled using
         # pickle protocol 2.
         try:
@@ -123,10 +152,10 @@ def deserialize_metadata(metastr):
         except Exception:
             logging.warning("pickle.loads() failed.", exc_info=True)
             return {}
-    elif metastr.startswith('{') and metastr.endswith('}'):
+    elif metastr.startswith(start2) and metastr.endswith(end2):
         try:
             metadata = json.loads(metastr)
-            utf8encodekeys(metadata)
+            native_str_keys_and_values(metadata)
             return metadata
         except (UnicodeDecodeError, ValueError):
             logging.warning("json.loads() failed.", exc_info=True)
@@ -143,12 +172,11 @@ def read_metadata(path_or_fd):
 
     :returns: dictionary of metadata
     """
-    metastr = ''
+    metastr = ""
     key = 0
     try:
         while True:
-            metastr += do_getxattr(path_or_fd, '%s%s' %
-                                   (METADATA_KEY, (key or '')))
+            metastr += do_getxattr(path_or_fd, "%s%s" % (METADATA_KEY, (key or "")))
             key += 1
             if len(metastr) < MAX_XATTR_SIZE:
                 # Prevent further getxattr calls
@@ -182,24 +210,29 @@ def write_metadata(path_or_fd, metadata):
     key = 0
     while metastr:
         try:
-            do_setxattr(path_or_fd,
-                        '%s%s' % (METADATA_KEY, key or ''),
-                        metastr[:MAX_XATTR_SIZE])
+            do_setxattr(
+                path_or_fd, "%s%s" % (METADATA_KEY, key or ""), metastr[:MAX_XATTR_SIZE]
+            )
         except IOError as err:
             if err.errno in (errno.ENOSPC, errno.EDQUOT):
                 if isinstance(path_or_fd, int):
                     filename = get_filename_from_fd(path_or_fd)
-                    do_log_rl("write_metadata(%d, metadata) failed: %s : %s",
-                              path_or_fd, err, filename)
+                    do_log_rl(
+                        "write_metadata(%d, metadata) failed: %s : %s",
+                        path_or_fd,
+                        err,
+                        filename,
+                    )
                 else:
-                    do_log_rl("write_metadata(%s, metadata) failed: %s",
-                              path_or_fd, err)
+                    do_log_rl(
+                        "write_metadata(%s, metadata) failed: %s", path_or_fd, err
+                    )
                 raise DiskFileNoSpace()
             else:
                 raise SwiftOnFileSystemIOError(
                     err.errno,
-                    '%s, setxattr("%s", %s, metastr)' % (err.strerror,
-                                                         path_or_fd, key))
+                    '%s, setxattr("%s", %s, metastr)' % (err.strerror, path_or_fd, key),
+                )
         metastr = metastr[MAX_XATTR_SIZE:]
         key += 1
 
@@ -208,13 +241,13 @@ def clean_metadata(path_or_fd):
     key = 0
     while True:
         try:
-            do_removexattr(path_or_fd, '%s%s' % (METADATA_KEY, (key or '')))
+            do_removexattr(path_or_fd, "%s%s" % (METADATA_KEY, (key or "")))
         except IOError as err:
             if err.errno == errno.ENODATA:
                 break
             raise SwiftOnFileSystemIOError(
-                err.errno, '%s, removexattr("%s", %s)' % (err.strerror,
-                                                          path_or_fd, key))
+                err.errno, '%s, removexattr("%s", %s)' % (err.strerror, path_or_fd, key)
+            )
         key += 1
 
 
@@ -222,12 +255,14 @@ def validate_object(metadata, statinfo=None):
     if not metadata:
         return False
 
-    if X_TIMESTAMP not in metadata.keys() or \
-       X_CONTENT_TYPE not in metadata.keys() or \
-       X_ETAG not in metadata.keys() or \
-       X_CONTENT_LENGTH not in metadata.keys() or \
-       X_TYPE not in metadata.keys() or \
-       X_OBJECT_TYPE not in metadata.keys():
+    if (
+        X_TIMESTAMP not in metadata.keys()
+        or X_CONTENT_TYPE not in metadata.keys()
+        or X_ETAG not in metadata.keys()
+        or X_CONTENT_LENGTH not in metadata.keys()
+        or X_TYPE not in metadata.keys()
+        or X_OBJECT_TYPE not in metadata.keys()
+    ):
         return False
 
     if statinfo and stat.S_ISREG(statinfo.st_mode):
@@ -237,16 +272,15 @@ def validate_object(metadata, statinfo=None):
             return False
 
         # File might have changed with length being the same.
-        if X_MTIME in metadata and \
-                normalize_timestamp(metadata[X_MTIME]) != \
-                normalize_timestamp(statinfo.st_mtime):
+        if X_MTIME in metadata and normalize_timestamp(
+            metadata[X_MTIME]
+        ) != normalize_timestamp(statinfo.st_mtime):
             return False
 
     if metadata[X_TYPE] == OBJECT:
         return True
 
-    logging.warn('validate_object: metadata type is not OBJECT (%r)',
-                 metadata[X_TYPE])
+    logging.warn("validate_object: metadata type is not OBJECT (%r)", metadata[X_TYPE])
     return False
 
 
@@ -254,7 +288,7 @@ def _read_for_etag(fp):
     etag = md5()
     while True:
         chunk = do_read(fp, CHUNK_SIZE)
-        if chunk:
+        if chunk:  # pragma: no cover
             etag.update(chunk)
             if len(chunk) >= CHUNK_SIZE:
                 # It is likely that we have more data to be read from the
@@ -275,7 +309,7 @@ def _get_etag(path_or_fd):
     Since we don't have that we should yield after each chunk read and
     computed so that we don't consume the worker thread.
     """
-    etag = ''
+    etag = ""
     if isinstance(path_or_fd, int):
         # We are given a file descriptor, so this is an invocation from the
         # DiskFile.open() method.
@@ -324,7 +358,8 @@ def get_object_metadata(obj_path_or_fd, stats=None):
             X_OBJECT_TYPE: DIR_NON_OBJECT if is_dir else FILE,
             X_CONTENT_LENGTH: 0 if is_dir else stats.st_size,
             X_MTIME: 0 if is_dir else normalize_timestamp(stats.st_mtime),
-            X_ETAG: md5().hexdigest() if is_dir else _get_etag(obj_path_or_fd)}
+            X_ETAG: md5().hexdigest() if is_dir else _get_etag(obj_path_or_fd),
+        }
     return metadata
 
 
@@ -447,10 +482,10 @@ def write_pickle(obj, dest, tmp=None, pickle_protocol=0):
         if err.errno != errno.EEXIST:
             raise
     basename = os.path.basename(dest)
-    tmpname = '.' + basename + '.' + \
-        md5(basename + str(random.random())).hexdigest()
+    to_md5 = (basename + str(random.random())).encode()
+    tmpname = "." + basename + "." + md5(to_md5).hexdigest()
     tmppath = os.path.join(dirname, tmpname)
-    with open(tmppath, 'wb') as fo:
+    with open(tmppath, "wb") as fo:
         pickle.dump(obj, fo, pickle_protocol)
         # TODO: This flush() method call turns into a flush() system call
         # We'll need to wrap this as well, but we would do this by writing
@@ -459,3 +494,20 @@ def write_pickle(obj, dest, tmp=None, pickle_protocol=0):
         fo.flush()
         do_fsync(fo)
     do_rename(tmppath, dest)
+
+
+def is_tmp_obj(filepath):
+    filename = os.path.basename(filepath)
+    if REGEX_TMP_FILE.match(filename):
+        return True
+    return False
+
+
+def get_user_uid_gid(username):
+    pw = pwd.getpwnam(username)
+    return pw.pw_uid, pw.pw_gid
+
+
+def get_group_gid(groupname):
+    gr = grp.getgrnam(groupname)
+    return gr.gr_gid
