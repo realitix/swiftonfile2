@@ -86,7 +86,7 @@ create_rpm()
 
 create_src()
 {
-    python setup.py sdist --format=gztar --dist-dir=${BUILDDIR}
+    python3 setup.py sdist --format=gztar --dist-dir=${BUILDDIR}
     if [ $? -ne 0 ] ; then
         fail "Unable to create source archive"
     fi
@@ -96,7 +96,7 @@ create_src()
 
 # Create a config file with the package information
 PKGCONFIG=${PWD}/pkgconfig.in
-env python pkgconfig.py
+env python3 pkgconfig.py
 if [ ! -f "${PKGCONFIG}" ] ; then
     fail "Unable to create package information file ${PKGCONFIG}" 1
 fi
